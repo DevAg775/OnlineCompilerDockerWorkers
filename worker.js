@@ -2,6 +2,7 @@ import amqp from 'amqplib';
 import Docker from 'dockerode';
 import { promises as fs } from 'fs';
 import path from 'path';
+import { PassThrough } from 'stream';
 import { v4 as uuidv4 } from 'uuid';
 import WebSocket, { WebSocketServer } from 'ws';
 import { fileURLToPath } from 'url';
@@ -31,21 +32,21 @@ export class WorkerService {
         heartbeat: 60,
         timeout: 60000
       });
-      
+
       // Create channel with confirmation
       this.channel = await this.connection.createConfirmChannel();
-      
+
       // Set prefetch
       await this.channel.prefetch(1);
 
       // Ensure queue exists with all options explicitly set
       const queue = 'CodeSender';
-      const queueInfo = await this.channel.assertQueue(queue, { 
+      const queueInfo = await this.channel.assertQueue(queue, {
         durable: true,
         autoDelete: false,
         exclusive: false
       });
-      
+
       console.log(`Queue ${queueInfo.queue} is ready with ${queueInfo.messageCount} messages`);
 
       // Add robust error handling
@@ -84,10 +85,10 @@ export class WorkerService {
       this.wss.on('connection', (ws, req) => {
         const executionId = new URL(req.url, `ws://${req.headers.host}`).pathname.split('/')[1];
         console.log(`New connection for execution: ${executionId}`);
-        
+
         // Store WebSocket connection
         this.executionSessions.set(executionId, ws);
-        
+
         // Handle client disconnection
         ws.on('close', () => {
           console.log(`Connection closed for execution: ${executionId}`);
@@ -111,6 +112,15 @@ export class WorkerService {
 
     for (const image of requiredImages) {
       try {
+        // Check if image already exists locally
+        const existingImages = await this.docker.listImages({
+          filters: { reference: [image] }
+        });
+        if (existingImages.length > 0) {
+          console.log(`Image ${image} already exists locally, skipping pull.`);
+          continue;
+        }
+
         console.log(`Pulling ${image}...`);
         await new Promise((resolve, reject) => {
           this.docker.pull(image, (err, stream) => {
@@ -155,7 +165,7 @@ export class WorkerService {
     try {
       const data = JSON.parse(msg.content.toString());
       console.log('Parsed message data:', data); // Debug log
-      
+
       // Get language from either 'Lang' or 'language' field
       const language = (data.Lang || data.language || '').toLowerCase();
       const code = data.code;
@@ -167,8 +177,9 @@ export class WorkerService {
 
       console.log(`Processing ${language} code execution...`); // Debug log
 
-      // Create unique working directory for this execution
-      const executionId = uuidv4();
+      // Use executionId from the backend message so the frontend can connect via WebSocket
+      const executionId = data.executionId || uuidv4();
+      console.log(`Execution ID: ${executionId}`);
       const workDir = path.join(__dirname, 'temp', executionId);
       await fs.mkdir(workDir, { recursive: true });
 
@@ -176,7 +187,7 @@ export class WorkerService {
       const result = await this.executeCode(code, language, input, workDir);
 
       // Clean up
-      await fs.rmdir(workDir, { recursive: true });
+      await fs.rm(workDir, { recursive: true, force: true });
 
       // Send result back
       await this.channel.sendToQueue(
@@ -194,18 +205,56 @@ export class WorkerService {
     }
   }
 
+  // Helper: wait for WebSocket connection for a given executionId
+  waitForConnection(executionId, timeoutMs = 5000) {
+    return new Promise((resolve) => {
+      const existing = this.executionSessions.get(executionId);
+      if (existing) return resolve(existing);
+
+      const checkInterval = setInterval(() => {
+        const ws = this.executionSessions.get(executionId);
+        if (ws) {
+          clearInterval(checkInterval);
+          clearTimeout(timeout);
+          resolve(ws);
+        }
+      }, 100);
+
+      const timeout = setTimeout(() => {
+        clearInterval(checkInterval);
+        console.log(`WebSocket connection timeout for ${executionId}, proceeding without it`);
+        resolve(null);
+      }, timeoutMs);
+    });
+  }
+
+  // Helper: get current ws for an execution (always fresh lookup)
+  getWs(executionId) {
+    return this.executionSessions.get(executionId);
+  }
+
   async executeCode(code, language, input, workDir) {
     const containerConfig = this.getContainerConfig(language);
     const { imageName, command, extension } = containerConfig;
     const executionId = path.basename(workDir);
-    const ws = this.executionSessions.get(executionId);
     let outputBuffer = [];
 
     try {
+      // Write code to file in the working directory
+      const filename = `code${extension}`;
+      await fs.writeFile(path.join(workDir, filename), code);
+
+      // Wait for WebSocket connection from the frontend (up to 5s)
+      console.log(`Waiting for WebSocket connection for ${executionId}...`);
+      const ws = await this.waitForConnection(executionId);
+      if (ws) {
+        console.log(`WebSocket connected for ${executionId}`);
+      }
+
       const container = await this.docker.createContainer({
         Image: imageName,
         WorkingDir: '/code',
-        Cmd: command(extension),
+        Cmd: command(filename),
         AttachStdout: true,
         AttachStderr: true,
         AttachStdin: true,
@@ -221,7 +270,7 @@ export class WorkerService {
         }
       });
 
-      await container.start();
+      // Attach BEFORE starting so we capture all output from the very beginning
       const stream = await container.attach({
         stream: true,
         stdin: true,
@@ -229,31 +278,62 @@ export class WorkerService {
         stderr: true
       });
 
-      if (ws) {
-        // Collect and send real-time logs
-        stream.on('data', (chunk) => {
-          const output = chunk.toString('utf8').replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
-          outputBuffer.push(output);
-          
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-              type: 'output',
-              data: output,
-              timestamp: Date.now()
-            }));
+      // Demux Docker's multiplexed stream (Tty:false adds 8-byte binary headers)
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      this.docker.modem.demuxStream(stream, stdout, stderr);
+
+      // Handler for clean output from stdout/stderr
+      const handleOutput = (chunk, isError = false) => {
+        const output = chunk.toString('utf8').replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+        if (!output.trim()) return; // skip empty chunks
+        outputBuffer.push(output);
+        console.log(`[${executionId}] ${isError ? 'Stderr' : 'Output'}: ${output.trim()}`);
+
+        const currentWs = this.getWs(executionId);
+        if (currentWs?.readyState === WebSocket.OPEN) {
+          currentWs.send(JSON.stringify({
+            type: 'output',
+            data: output,
+            timestamp: Date.now()
+          }));
+        }
+      };
+
+      stdout.on('data', (chunk) => handleOutput(chunk, false));
+      stderr.on('data', (chunk) => handleOutput(chunk, true));
+
+      // Forward WebSocket input to container stdin
+      const currentWs = this.getWs(executionId);
+      if (currentWs) {
+        currentWs.on('message', (msg) => {
+          try {
+            const parsed = JSON.parse(msg.toString());
+            if (parsed.type === 'input' && parsed.data !== undefined) {
+              stream.write(parsed.data + '\n');
+              console.log(`[${executionId}] Stdin: ${parsed.data}`);
+            }
+          } catch (e) {
+            // Raw string input
+            stream.write(msg.toString() + '\n');
           }
         });
-
-        // Send initial status
-        this.sendMessage(ws, 'status', 'Execution started');
       }
+
+      // Now start the container (output handler is already attached)
+      await container.start();
+
+      // Send initial status
+      const statusWs = this.getWs(executionId);
+      this.sendMessage(statusWs, 'status', 'Execution started');
 
       return new Promise((resolve) => {
         container.wait(async (err, data) => {
-          if (ws?.readyState === WebSocket.OPEN) {
-            // Send final logs
-            const fullLogs = outputBuffer.join('\n');
-            ws.send(JSON.stringify({
+          const fullLogs = outputBuffer.join('\n');
+          const doneWs = this.getWs(executionId);
+
+          if (doneWs?.readyState === WebSocket.OPEN) {
+            doneWs.send(JSON.stringify({
               type: 'logs',
               data: fullLogs,
               exitCode: data.StatusCode,
@@ -261,7 +341,7 @@ export class WorkerService {
             }));
 
             // Send completion
-            this.sendMessage(ws, 'completion', 'Execution finished', data.StatusCode);
+            this.sendMessage(doneWs, 'completion', 'Execution finished', data.StatusCode);
           }
 
           // Get Docker engine logs
@@ -270,10 +350,10 @@ export class WorkerService {
             stderr: true,
             timestamps: true
           });
-          
+
           // Save logs to file
           await fs.writeFile(
-            path.join(workDir, 'docker.log'), 
+            path.join(workDir, 'docker.log'),
             dockerLogs.toString('utf8')
           );
 
@@ -286,7 +366,8 @@ export class WorkerService {
         });
       });
     } catch (error) {
-      this.sendMessage(ws, 'error', error.message);
+      const errWs = this.getWs(executionId);
+      this.sendMessage(errWs, 'error', error.message);
       throw error;
     }
   }
@@ -301,7 +382,7 @@ export class WorkerService {
       cpp: {
         imageName: 'gcc:latest',
         extension: '.cpp',
-        command: (filename) => ['g++', filename, '-o', 'output', '&&', './output']
+        command: (filename) => ['sh', '-c', `g++ ${filename} -o output && ./output`]
       }
     };
 
