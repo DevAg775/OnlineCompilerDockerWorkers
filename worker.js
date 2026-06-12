@@ -6,6 +6,7 @@ import { PassThrough } from 'stream';
 import { v4 as uuidv4 } from 'uuid';
 import WebSocket, { WebSocketServer } from 'ws';
 import { fileURLToPath } from 'url';
+import { connectMongo, Execution } from './db.js'
 
 // Get __dirname equivalent in ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -22,9 +23,12 @@ export class WorkerService {
 
   async initialize() {
     try {
+      // Connect MongoDB first
+      await connectMongo()
+
       // Pull required Docker images first
-      console.log('Pulling required Docker images...');
-      await this.pullDockerImages();
+      console.log('Pulling required Docker images...')
+      await this.pullDockerImages()
 
       // Connect to RabbitMQ with connection options
       const amqpServer = 'amqp://guest:guest@localhost:5672'; // Adding default credentials
@@ -162,11 +166,11 @@ export class WorkerService {
   }
 
   async processMessage(msg) {
+    let data; // Declared outside try so catch block can access it for error update
     try {
-      const data = JSON.parse(msg.content.toString());
-      console.log('Parsed message data:', data); // Debug log
+      data = JSON.parse(msg.content.toString());
+      console.log('Parsed message data:', data);
 
-      // Get language from either 'Lang' or 'language' field
       const language = (data.Lang || data.language || '').toLowerCase();
       const code = data.code;
       const input = data.input;
@@ -175,21 +179,39 @@ export class WorkerService {
         throw new Error('Language not specified in the message');
       }
 
-      console.log(`Processing ${language} code execution...`); // Debug log
+      console.log(`Processing ${language} code execution...`);
 
-      // Use executionId from the backend message so the frontend can connect via WebSocket
       const executionId = data.executionId || uuidv4();
       console.log(`Execution ID: ${executionId}`);
+
+      // Mark execution as running in MongoDB
+      await Execution.findOneAndUpdate(
+        { executionId },
+        { status: 'running' }
+      );
+      console.log(`Execution ${executionId} marked as running`);
+
       const workDir = path.join(__dirname, 'temp', executionId);
       await fs.mkdir(workDir, { recursive: true });
 
-      // Execute code based on language
       const result = await this.executeCode(code, language, input, workDir);
 
-      // Clean up
+      // Mark execution as completed in MongoDB
+      await Execution.findOneAndUpdate(
+        { executionId },
+        {
+          status: 'completed',
+          output: result.logs,
+          exitCode: result.exitCode,
+          completedAt: new Date()
+        }
+      );
+      console.log(`Execution ${executionId} marked as completed`);
+
+      // Clean up temp files
       await fs.rm(workDir, { recursive: true, force: true });
 
-      // Send result back
+      // Send result back to queue
       await this.channel.sendToQueue(
         'execution_results_queue',
         Buffer.from(JSON.stringify(result)),
@@ -197,6 +219,20 @@ export class WorkerService {
       );
     } catch (error) {
       console.error('Error processing message:', error);
+
+      // Mark execution as failed in MongoDB if we have an executionId
+      if (data?.executionId) {
+        await Execution.findOneAndUpdate(
+          { executionId: data.executionId },
+          {
+            status: 'failed',
+            error: error.message,
+            completedAt: new Date()
+          }
+        );
+        console.log(`Execution ${data.executionId} marked as failed`);
+      }
+
       await this.channel.sendToQueue(
         'execution_results_queue',
         Buffer.from(JSON.stringify({ error: error.message })),

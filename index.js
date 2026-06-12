@@ -1,4 +1,7 @@
 import { WorkerService } from './worker.js';
+import dotenv from 'dotenv';
+dotenv.config();
+
 
 async function main() {
   const worker = new WorkerService();
